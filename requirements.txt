@@ -1,0 +1,15 @@
+pyzx==0.10.5
+torch>=2.0
+torch-geometric>=2.5
+numpy
+gymnasium
+matplotlib
+seaborn
+pandas
+tqdm
+
+# optional -- only for scripts/visualize_graph_transform.py's gate-box circuit
+# diagrams (pyzx has no circuit-diagram renderer of its own); also installable via
+# `pip install -e .[viz]`
+# qiskit
+# pylatexenc
