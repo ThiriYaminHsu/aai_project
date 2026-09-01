@@ -1,0 +1,146 @@
+"""Combined agent v2: pooling at the DISTILLATION stage (follow-up to
+combined v1, overnight 2026-09-01/02). v1 showed that pooling at the
+SEARCH stage destroys the adder search prior: the intermediate policy's
+random-family-shaped prior found zero guided adder wins (blind search
+finds 3/7 widths), so v1's final dataset contained no adder content.
+
+v2 separates the two mechanisms. The adder trajectories are collected
+with the proven Agent A v4 checkpoint guiding chained search (250/round,
+<=4 rounds), guaranteeing good adder labels; the random-family winners
+are collected exactly as in v1/R-P v3. One fresh 128-channel policy is
+then distilled from the pooled pairs. Question: does Agent A's motif
+survive pooled TRAINING DATA when the trajectories themselves are good?
+
+Evaluation identical to v1 (best-of-10, Chapter-4 protocol): adders 2-10
+incl. held-out 4/10, 5 structured-random, 5 pure-random (untrained
+control alongside), 11 real-world arithmetic.
+
+Saves results/checkpoints/agent_combined_v2.pt and
+results/logs/agent_combined_v2_eval.csv.
+
+Usage:
+    python3 scripts/train_agent_combined_v2_pooled_labels.py
+"""
+
+import csv
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+import torch
+
+import train_agent_a_v3 as v3
+import scripts.expert_iteration_agents_rp as rp
+from benchmarks.fetch_paper_circuits import load_all as load_paper
+from circopt_adder.config import DEVICE, SEED, Config, set_seed
+from circopt_adder.generators import (
+    _light_preprocess,
+    make_pure_random_circuit_generator,
+    make_random_circuit_generator,
+    ripple_carry_adder,
+)
+from circopt_adder.model import ActorCriticGNN
+from circopt_adder.zx_utils import two_qubit_gate_count
+
+TRAIN_BITS = [2, 3, 5, 6, 7, 8, 9]
+HELDOUT_BITS = [4, 10]
+ARITH = ("add", "qcla", "mod")
+EPOCHS = 150
+
+rp.N_TRAIN, rp.N_ROLLOUTS = 150, 15
+
+
+def best_of_10(policy, cfg, circ):
+    start = two_qubit_gate_count(circ)
+    best, _, _ = v3.episode(cfg, circ, policy=policy, greedy=True)
+    for _ in range(9):
+        m, _, _ = v3.episode(cfg, circ, policy=policy)
+        best = min(best, m)
+    return start, best
+
+
+def main():
+    set_seed(SEED)
+    cfg = v3.make_cfg()
+    adders = {b: _light_preprocess(ripple_carry_adder(b).to_graph()) for b in TRAIN_BITS}
+    gens = {
+        "structured_random": make_random_circuit_generator(
+            cfg.n_qubits, cfg.n_gates_random, seed=SEED + 5),
+        "pure_random": make_pure_random_circuit_generator(
+            cfg.pure_random_min_qubits, cfg.pure_random_max_qubits,
+            cfg.pure_random_min_gates, cfg.pure_random_max_gates, seed=SEED + 5),
+    }
+
+    print("=== v2 Step 1a: guided adder search using Agent A v4 checkpoint ===", flush=True)
+    guide = ActorCriticGNN(cfg).to(DEVICE)
+    guide.load_state_dict(torch.load(
+        REPO_ROOT / "results" / "checkpoints" / "agent_A_v4_correct.pt",
+        map_location=DEVICE))
+    guide.eval()
+    v3.MAX_ROUNDS = 4
+    adder_pairs = []
+    for b, c in adders.items():
+        _, pairs, _ = v3.chained_collect(cfg, c, 250, policy=guide, label=f"A-guided {b}b")
+        adder_pairs.extend(pairs)
+    print(f"adder pairs (A-guided): {len(adder_pairs)}", flush=True)
+
+    print("=== v2 Step 1b: blind search, random families ===", flush=True)
+    family_pairs = {}
+    for name, gen in gens.items():
+        print(f"--- {name} ---", flush=True)
+        family_pairs[name] = rp.collect_winners([gen() for _ in range(rp.N_TRAIN)], cfg)
+        print(f"{name} pairs: {len(family_pairs[name])}", flush=True)
+
+    print("=== v2 Step 2: fresh distill on pooled labels ===", flush=True)
+    final_data = adder_pairs + family_pairs["structured_random"] + family_pairs["pure_random"]
+    print(f"pooled dataset: {len(adder_pairs)} adder + "
+          f"{len(final_data) - len(adder_pairs)} random-family pairs", flush=True)
+    policy = v3.distill(list(final_data), cfg, epochs=EPOCHS)
+
+    out = REPO_ROOT / "results" / "checkpoints" / "agent_combined_v2.pt"
+    torch.save(policy.state_dict(), out)
+    print(f"Saved {out}", flush=True)
+
+    print("=== v2 Step 3: evaluation (best-of-10) ===", flush=True)
+    rows = []
+    untrained = ActorCriticGNN(cfg).to(DEVICE)
+    untrained.eval()
+
+    for b in TRAIN_BITS + HELDOUT_BITS:
+        circ = _light_preprocess(ripple_carry_adder(b).to_graph())
+        start, best = best_of_10(policy, cfg, circ)
+        tag = "heldout" if b in HELDOUT_BITS else "train"
+        rows.append((f"adder{b}", tag, start, best, ""))
+        print(f"[adder {b}-bit {tag}] start={start} combined-v2={best}", flush=True)
+
+    for name, gen in gens.items():
+        for i in range(5):
+            circ = gen()
+            start, best = best_of_10(policy, cfg, circ)
+            _, ubest = best_of_10(untrained, cfg, circ)
+            rows.append((f"{name}_{i}", name, start, best, ubest))
+            print(f"[{name} {i}] start={start} combined-v2={best} untrained={ubest}", flush=True)
+
+    for name, c in sorted(load_paper().items()):
+        if not any(k in name.lower() for k in ARITH):
+            continue
+        circ = _light_preprocess(c.to_basic_gates().to_graph())
+        start, best = best_of_10(policy, cfg, circ)
+        rows.append((name, "real_world", start, best, ""))
+        print(f"[real {name}] start={start} combined-v2={best}", flush=True)
+
+    csv_out = REPO_ROOT / "results" / "logs" / "agent_combined_v2_eval.csv"
+    with open(csv_out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["circuit", "family", "start_2q", "combined_v2_best10_2q", "untrained_best10_2q"])
+        w.writerows(rows)
+    print(f"Saved {csv_out}", flush=True)
+    print("DONE", flush=True)
+
+
+if __name__ == "__main__":
+    main()
